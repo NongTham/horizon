@@ -2,6 +2,7 @@
 //! What needs a renderer (inventory slots, screenshots) is covered by tools/pad_parity_e2e.py.
 
 use super::super::{Audio, Game, Options, Progress, Screen, Settings, load_resources};
+use crate::game::event_loop::EventLoopCtl;
 use horizon_client::actions::Action;
 use horizon_client::command::args::GameMode;
 use horizon_client::gamepad::{Button, PadState};
@@ -9,7 +10,15 @@ use horizon_client::held::Source;
 use horizon_client::motion::PlayerMotion;
 use horizon_core::geometry::Vec3;
 use winit::event::MouseButton;
+use winit::event_loop::ControlFlow;
 use winit::keyboard::KeyCode;
+
+struct NoopLoop;
+
+impl EventLoopCtl for NoopLoop {
+    fn exit(&self) {}
+    fn set_control_flow(&self, _flow: ControlFlow) {}
+}
 
 /// A game at play with no world: input reaches the mappings, as in `Screen::Playing`.
 fn playing(test: impl FnOnce(&mut Game)) {
@@ -42,20 +51,41 @@ fn playing(test: impl FnOnce(&mut Game)) {
     .unwrap();
     game.title = None;
     game.screen = Screen::Playing;
+    game.pad.virtual_input = true;
     test(&mut game);
 }
 
-/// Hold `button` on the pad, as a poll that saw it go down would.
-fn pad_press(game: &mut Game, button: Button, action: &str) {
+fn pad_state_with(game: &Game, button: Button, down: bool) -> PadState {
     let mut state = PadState::default();
-    // A trigger is held by how far it's pulled, not by a button bit.
-    match button {
-        Button::LeftTrigger => state.triggers[0] = 1.0,
-        Button::RightTrigger => state.triggers[1] = 1.0,
-        _ => state.set(button, true),
+    for b in Button::ALL {
+        let is_down = if b == button {
+            down
+        } else {
+            game.pad.edges.is_held(b)
+        };
+        if is_down {
+            match b {
+                Button::LeftTrigger => state.triggers[0] = 1.0,
+                Button::RightTrigger => state.triggers[1] = 1.0,
+                _ => state.set(b, true),
+            }
+        }
     }
+    state
+}
+
+/// Hold `button` on the pad, as a poll that saw it go down would.
+fn pad_press(game: &mut Game, button: Button, _action: &str) {
+    let state = pad_state_with(game, button, true);
     game.pad.edges.update(&state, 0.4);
-    game.pad_action(action, true).unwrap();
+    game.pad_button(&NoopLoop, button, true).unwrap();
+}
+
+/// Release `button` on the pad, as a poll that saw it go up would.
+fn pad_release(game: &mut Game, button: Button) {
+    let state = pad_state_with(game, button, false);
+    game.pad.edges.update(&state, 0.4);
+    game.pad_button(&NoopLoop, button, false).unwrap();
 }
 
 #[test]
@@ -203,7 +233,7 @@ fn the_pads_attack_and_use_reach_what_the_mouse_tells_mods() {
         pad_press(game, Button::RightTrigger, "key.attack");
         assert!(game.native_mapping("key.attack").unwrap().0);
         assert_eq!(game.native_clicks(), (1, 0));
-        game.pad_action("key.attack", false).unwrap();
+        pad_release(game, Button::RightTrigger);
         assert!(!game.native_mapping("key.attack").unwrap().0);
         pad_press(game, Button::LeftTrigger, "key.use");
         assert!(game.native_mapping("key.use").unwrap().0);
@@ -222,8 +252,7 @@ fn the_mouse_letting_go_leaves_what_the_pad_holds_and_back() {
             .unwrap();
         assert!(game.left, "the pad still holds the attack");
         // The pad let go, so its edges are no longer held either.
-        game.pad.edges.update(&PadState::default(), 0.4);
-        game.pad_action("key.attack", false).unwrap();
+        pad_release(game, Button::RightTrigger);
         assert!(!game.left);
 
         // The other way round: the mouse button is physically down.
@@ -231,8 +260,7 @@ fn the_mouse_letting_go_leaves_what_the_pad_holds_and_back() {
         game.mouse_mapping(MouseButton::Right, true, Source::Keyboard)
             .unwrap();
         pad_press(game, Button::LeftTrigger, "key.use");
-        game.pad.edges.update(&PadState::default(), 0.4);
-        game.pad_action("key.use", false).unwrap();
+        pad_release(game, Button::LeftTrigger);
         assert!(game.right, "the mouse still holds the use");
         game.physical_buttons.remove(&MouseButton::Right);
         game.mouse_mapping(MouseButton::Right, false, Source::Keyboard)
@@ -251,8 +279,7 @@ fn a_release_from_a_screen_can_not_strand_the_pads_attack() {
         game.left = false;
         pad_press(game, Button::RightTrigger, "key.attack");
         assert!(game.left);
-        game.pad.edges.update(&PadState::default(), 0.4);
-        game.pad_action("key.attack", false).unwrap();
+        pad_release(game, Button::RightTrigger);
         assert!(!game.left, "nothing is physically held");
     });
 }
